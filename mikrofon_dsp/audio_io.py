@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
+from pathlib import Path
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.request
+import zipfile
 from typing import Any
 
 import numpy as np
@@ -16,6 +20,11 @@ from .pipeline import VoiceEnhancerPipeline
 
 
 logger = logging.getLogger("mikrofon")
+
+VBCABLE_URLS = (
+    "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip",
+    "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip",
+)
 
 VIRTUAL_CABLE_KEYWORDS = (
     "cable input",
@@ -67,7 +76,7 @@ def _get_sd() -> Any:
 
 
 def refresh_audio_backend() -> None:
-    """Re-initialize PortAudio so newly connected USB microphones are detected."""
+    """Re-initialize PortAudio so newly connected USB microphones or virtual cables are detected."""
     try:
         import sounddevice as sd
 
@@ -93,7 +102,6 @@ def list_audio_devices() -> list[AudioDeviceInfo]:
     hostapis = sd.query_hostapis()
     default_in, default_out = sd.default.device
 
-    # Prefer primary OS host API when deduplicating / ranking
     result: list[AudioDeviceInfo] = []
     for idx, dev in enumerate(raw_devices):
         api_idx = int(dev.get("hostapi", 0))
@@ -141,7 +149,6 @@ def resolve_input_device(
             "Проверьте подключение микрофона к ПК."
         )
 
-    # Explicit index
     if isinstance(requested, int) or (isinstance(requested, str) and requested.isdigit()):
         idx = int(requested)
         for d in inputs:
@@ -149,7 +156,6 @@ def resolve_input_device(
                 return d
         raise RuntimeError(f"Микрофон с индексом {idx} не найден. Проверьте `python mikrofon.py devices`.")
 
-    # Explicit name substring
     if isinstance(requested, str) and requested.strip():
         needle = requested.strip().lower()
         matches = [d for d in inputs if needle in d.name.lower()]
@@ -160,12 +166,10 @@ def resolve_input_device(
             f"Микрофон '{requested}' не найден. Запустите `python mikrofon.py devices` для просмотра списка."
         )
 
-    # Auto-detect: prefer default input if it is NOT a virtual cable / stereo mix
     for d in inputs:
         if d.is_default_input and not _should_skip_physical_input(d.name):
             return d
 
-    # Otherwise pick the best physical microphone
     physical = [d for d in inputs if not _should_skip_physical_input(d.name)]
     if physical:
         physical.sort(key=lambda d: _hostapi_priority(d.hostapi_name))
@@ -184,7 +188,6 @@ def resolve_output_device(
     if not outputs:
         return None
 
-    # Explicit index
     if isinstance(requested, int) or (isinstance(requested, str) and requested.isdigit()):
         idx = int(requested)
         for d in outputs:
@@ -194,7 +197,6 @@ def resolve_output_device(
             f"Устройство вывода с индексом {idx} не найдено. Проверьте `python mikrofon.py devices`."
         )
 
-    # Explicit name substring
     if isinstance(requested, str) and requested.strip():
         needle = requested.strip().lower()
         matches = [d for d in outputs if needle in d.name.lower()]
@@ -205,10 +207,8 @@ def resolve_output_device(
             f"Устройство вывода '{requested}' не найдено. Запустите `python mikrofon.py devices`."
         )
 
-    # Auto-detect virtual audio cable sink (VB-Cable, VoiceMeeter, BlackHole, Mikrofon_Clean)
     virtual_sinks = [d for d in outputs if d.is_virtual]
     if virtual_sinks:
-        # Prefer "CABLE Input" or "mikrofon_clean" specifically
         def _sink_rank(d: AudioDeviceInfo) -> tuple[int, int]:
             low = d.name.lower()
             if "mikrofon_clean" in low or "cable input" in low or "blackhole" in low:
@@ -294,6 +294,90 @@ def play_snippet(
     sd.wait()
 
 
+def install_windows_vbcable() -> tuple[bool, str]:
+    """Automatically download and launch the official VB-Audio Virtual Cable installer on Windows."""
+    if platform.system().lower() != "windows":
+        return False, "Автоустановка VB-Cable предназначена только для Windows."
+
+    try:
+        existing = resolve_output_device(None, allow_speakers_fallback=False)
+        if existing is not None:
+            return (
+                True,
+                f"[OK] Виртуальный кабель уже установлен: {existing.name}\n"
+                "Теперь в настройках звука Windows / Telegram / Discord выберите микрофон:\n"
+                "  -> CABLE Output (VB-Audio Virtual Cable)",
+            )
+    except Exception:
+        pass
+
+    tmp_dir = Path(tempfile.gettempdir()) / "mikrofon_vbcable"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = tmp_dir / "vbcable.zip"
+
+    downloaded = False
+    for url in VBCABLE_URLS:
+        try:
+            print(f"Скачиваю бесплатный драйвер виртуального микрофона VB-Cable ({url})...")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                zip_path.write_bytes(resp.read())
+            downloaded = True
+            break
+        except Exception:
+            continue
+
+    if not downloaded:
+        return (
+            False,
+            "Не удалось автоматически скачать VB-Cable. Скачайте вручную с https://vb-audio.com/Cable/",
+        )
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(tmp_dir)
+
+    is_64 = platform.machine().endswith("64")
+    exe_name = "VBCABLE_Setup_x64.exe" if is_64 else "VBCABLE_Setup.exe"
+    installer = tmp_dir / exe_name
+    if not installer.exists():
+        candidates = list(tmp_dir.glob("VBCABLE_Setup*.exe"))
+        if not candidates:
+            return False, "Не найден установщик VBCABLE_Setup внутри архива."
+        installer = candidates[0]
+
+    print("\nСейчас откроется окно установки драйвера VB-Cable.")
+    print("Нажмите «Да» (разрешить запуск от администратора), а затем кнопку «Install Driver»!\n")
+    ps_cmd = (
+        f"Start-Process -FilePath '{installer}' -WorkingDirectory '{tmp_dir}' -Verb RunAs -Wait"
+    )
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=False)
+
+    time.sleep(1.5)
+    refresh_audio_backend()
+    try:
+        installed_dev = resolve_output_device(None, allow_speakers_fallback=False)
+    except Exception:
+        installed_dev = None
+
+    if installed_dev is not None:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Start-Process 'ms-settings:sound'"],
+            check=False,
+        )
+        return (
+            True,
+            f"[ГОТОВО] Виртуальный микрофон успешно установлен: {installed_dev.name}!\n"
+            "Открыты настройки звука Windows: в разделе «Ввод» (Input) выберите микрофон:\n"
+            "  -> CABLE Output (VB-Audio Virtual Cable)\n"
+            "Тогда во ВСЕХ голосовых сообщениях (Telegram, ВК, браузер, Discord) будет идти чистый звук!",
+        )
+
+    return (
+        False,
+        "Драйвер ещё не появился в списке устройств (если вы нажали Install Driver, иногда требуется перезагрузка ПК).",
+    )
+
+
 def setup_linux_virtual_mic() -> tuple[bool, str]:
     """Create a PipeWire / PulseAudio virtual microphone `Mikrofon_Clean_Mic` on Linux."""
     if platform.system().lower() != "linux":
@@ -303,7 +387,6 @@ def setup_linux_virtual_mic() -> tuple[bool, str]:
     if not pactl:
         return False, "Утилита `pactl` не найдена. Установите пакет `pulseaudio-utils`."
 
-    # Check if already created
     check = subprocess.run(
         [pactl, "list", "short", "sinks"],
         capture_output=True,
@@ -352,7 +435,7 @@ def setup_linux_virtual_mic() -> tuple[bool, str]:
     )
 
 
-def _format_meter_bar(db: float, width: int = 18) -> str:
+def _format_meter_bar(db: float, width: int = 16) -> str:
     norm = float(np.clip((db + 60.0) / 60.0, 0.0, 1.0))
     filled = int(round(norm * width))
     return "█" * filled + "░" * (width - filled)
@@ -369,7 +452,6 @@ def run_realtime_loop(
     """
     sd = _get_sd()
 
-    # First check output routing before entering eternal loop so missing virtual cable gives clear guidance
     devices = list_audio_devices()
     in_dev = resolve_input_device(config.input_device, devices)
     out_dev = resolve_output_device(
@@ -380,23 +462,23 @@ def run_realtime_loop(
 
     if out_dev is None:
         sys_name = platform.system().lower()
-        print("\n[!] Не найден виртуальный аудиокабель для передачи очищенного звука в Discord/игры.")
-        print(f"    Ваш физический микрофон успешно найден: [{in_dev.index}] {in_dev.name}\n")
+        print("\n" + "!" * 72)
+        print("  ВНИМАНИЕ: НЕ УСТАНОВЛЕН ВИРТУАЛЬНЫЙ МИКРОФОН (VB-CABLE)!")
+        print("  Пока он не установлен, Telegram / ВК / Discord пишут ваш СТАРЫЙ")
+        print("  необработанный микрофон в обход этой программы!")
+        print("!" * 72)
+        print(f"\n  Ваш физический микрофон найден: [{in_dev.index}] {in_dev.name}\n")
         if sys_name == "windows":
-            print("Чтобы очищенный микрофон работал во всех программах на Windows:")
-            print("  1. Скачайте бесплатный драйвер VB-Audio Virtual Cable с официального сайта:")
-            print("     https://vb-audio.com/Cable/  (нажмите Download -> запустите VBCABLE_Setup_x64.exe от имени администратора)")
-            print("  2. Запустите этот скрипт снова — он сам найдёт 'CABLE Input'!")
-            print("  3. В Discord / Telegram / играх выберите микрофон: 'CABLE Output (VB-Audio Virtual Cable)'.")
+            print("  Установите виртуальный кабель прямо сейчас одной командой:")
+            print("     .\\.venv\\Scripts\\python.exe mikrofon.py install-cable\n")
+            print("  И после установки выберите микрофон 'CABLE Output (VB-Audio Virtual Cable)'")
+            print("  в настройках звука Windows (Ввод) и в Telegram / Discord.")
         elif sys_name == "linux":
-            print("На Linux создайте виртуальный микрофон одной командой (без скачивания программ):")
+            print("  Создайте виртуальный микрофон одной командой:")
             print("     python mikrofon.py setup-linux-mic")
-            print("После этого снова запустите `python mikrofon.py`.")
         else:
-            print("На macOS установите бесплатный драйвер BlackHole 2ch (brew install blackhole-2ch).")
-        print("\nХотите прямо сейчас послушать, как звучит ваш очищенный голос в наушниках?")
-        print("  -> Запустите тест До/После (5 секунд):  python mikrofon.py test")
-        print("  -> Или включите живое прослушивание:    python mikrofon.py run --monitor\n")
+            print("  На macOS установите драйвер BlackHole 2ch (brew install blackhole-2ch).")
+        print("\n  Проверить звук в наушниках прямо сейчас: python mikrofon.py test\n")
         return 2
 
     while True:
@@ -420,7 +502,8 @@ def run_realtime_loop(
             blocksize = pipeline.hop_size
 
             logger.info(
-                "Запущено шумоподавление | Вход: [%d] %s | Выход: [%d] %s | %d Гц | Пресет: %s",
+                "Активно | Движок: %s | Вход: [%d] %s | Выход: [%d] %s | %d Гц | Пресет: %s",
+                pipeline.active_engine_name,
                 in_dev.index,
                 in_dev.name,
                 out_dev.index,
@@ -429,18 +512,26 @@ def run_realtime_loop(
                 active_cfg.preset,
             )
             if not quiet:
-                print("=" * 72)
-                print("  MIKROFON — Шумоподавление и улучшение голоса активно!")
-                print(f"  Микрофон (вход) : [{in_dev.index}] {in_dev.name}")
-                print(f"  Выходной канал  : [{out_dev.index}] {out_dev.name}")
+                print("=" * 74)
+                print("  MIKROFON 2.0 — ИИ-шумоподавление и Анти-Бочка АКТИВНЫ!")
+                print(f"  Движок очистки  : {pipeline.active_engine_name} + Анти-Бочка (Dereverb)")
+                print(f"  Ваш микрофон    : [{in_dev.index}] {in_dev.name}")
+                print(f"  Виртуальный вых.: [{out_dev.index}] {out_dev.name}")
                 print(
-                    f"  Частота / буфер : {sr} Гц / {active_cfg.frame_ms} мс "
-                    f"| Режим: {active_cfg.preset}"
+                    f"  Частота / режим : {sr} Гц / {active_cfg.preset}"
                 )
+                if in_dev.default_samplerate <= 16000:
+                    print(
+                        "  [!] Внимание: микрофон работает в узкополосном режиме <=16 кГц "
+                        "(характерно для Bluetooth Hands-Free гарнитур)."
+                    )
                 if out_dev.is_virtual:
-                    print("  В Discord / играх выберите микрофон: 'CABLE Output' (или Mikrofon_Clean_Mic)")
-                print("  Для остановки нажмите Ctrl+C")
-                print("=" * 72)
+                    print("-" * 74)
+                    print("  ВАЖНО ДЛЯ ГС (Telegram / ВК / Discord / Игры):")
+                    print("  В настройках звука Windows (Ввод) или в самой программе должен быть")
+                    print("  выбран микрофон:  CABLE Output (VB-Audio Virtual Cable)")
+                print("  Для остановки нажмите Ctrl+C (или включите автозапуск и закройте окно)")
+                print("=" * 74)
 
             def _audio_callback(
                 indata: np.ndarray,
@@ -468,11 +559,11 @@ def run_realtime_loop(
                     if not quiet and sys.stdout.isatty():
                         in_bar = _format_meter_bar(pipeline.last_input_rms_db)
                         out_bar = _format_meter_bar(pipeline.last_output_rms_db)
-                        red = pipeline.spectral.last_reduction_db
+                        red = pipeline.last_reduction_db
                         line = (
                             f"\r  Вход [{in_bar}] {pipeline.last_input_rms_db:5.1f} dB | "
-                            f"Выход [{out_bar}] {pipeline.last_output_rms_db:5.1f} dB | "
-                            f"Подавление шума: -{red:4.1f} dB   "
+                            f"Чистый [{out_bar}] {pipeline.last_output_rms_db:5.1f} dB | "
+                            f"Шумодав: -{red:4.1f} dB   "
                         )
                         sys.stdout.write(line)
                         sys.stdout.flush()

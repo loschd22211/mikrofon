@@ -11,9 +11,10 @@ DEFAULT_CONFIG_PATH = Path("config.json")
 
 @dataclass
 class DenoiserConfig:
-    """Configuration for the real-time microphone noise suppression pipeline."""
+    """Configuration for the real-time microphone noise suppression & anti-barrel pipeline."""
 
     preset: str = "balanced"
+    engine: str = "auto"  # "auto" (Neural RNNoise v0.2 if available), "rnnoise", or "spectral"
     input_device: str | int | None = None
     output_device: str | int | None = None
     sample_rate: int = 48000
@@ -22,33 +23,40 @@ class DenoiserConfig:
     # Pre-gain (useful for quiet cheap 3.5mm / USB mics)
     input_gain_db: float = 0.0
 
-    # Stage 1 & 2: Rumble high-pass & electrical mains hum notch (50/60 Hz)
-    highpass_hz: float = 85.0
-    hum_filter_hz: float | None = 50.0
+    # Stage 1 & 2: Rumble high-pass & optional fundamental mains hum notch
+    highpass_hz: float = 95.0
+    hum_filter_hz: float | None = None
 
-    # Stage 3: Adaptive Ephraim-Malah spectral noise suppression
+    # Stage 3: Neural RNNoise v0.2 + Adaptive spectral suppression fallback
+    neural_wet_mix: float = 1.0
     suppression_strength: float = 1.8
-    spectral_floor_db: float = -28.0
+    spectral_floor_db: float = -30.0
     vad_snr_threshold_db: float = 4.5
 
-    # Stage 4: Smooth voice-aware noise gate / downward expander
+    # Stage 4: Real-time room dereverberation ("Анти-бочка" / room echo killer)
+    dereverb_enabled: bool = True
+    dereverb_strength: float = 0.65
+
+    # Stage 5: Smooth voice-aware noise gate / downward expander
     gate_enabled: bool = True
-    gate_threshold_db: float = -44.0
-    gate_attenuation_db: float = -22.0
-    gate_hold_ms: float = 160.0
-    gate_release_ms: float = 150.0
+    gate_threshold_db: float = -43.0
+    gate_attenuation_db: float = -26.0
+    gate_hold_ms: float = 150.0
+    gate_release_ms: float = 130.0
 
-    # Stage 5: Cheap-mic -> studio voice clarity EQ + HF hiss cut
+    # Stage 6: Studio Anti-Barrel Voice EQ + Open Air boost
     voice_eq_enabled: bool = True
-    mud_cut_db: float = -2.5
-    presence_boost_db: float = 3.0
-    lowpass_hz: float = 13500.0
+    mud_cut_db: float = -4.5
+    honk_cut_db: float = -2.0
+    presence_boost_db: float = 3.5
+    air_boost_db: float = 2.5
+    lowpass_hz: float = 16500.0
 
-    # Stage 6: Broadcast compressor & brickwall soft limiter
+    # Stage 7: Broadcast compressor & brickwall soft limiter
     compressor_enabled: bool = True
     compressor_threshold_db: float = -18.0
     compressor_ratio: float = 3.0
-    makeup_gain_db: float = 3.5
+    makeup_gain_db: float = 5.5
 
     # Optional diagnostic metadata saved by `calibrate`
     calibrated_mic_name: str | None = None
@@ -82,53 +90,91 @@ class DenoiserConfig:
 PRESETS: dict[str, dict[str, Any]] = {
     "balanced": {
         "preset": "balanced",
-        "highpass_hz": 85.0,
-        "hum_filter_hz": 50.0,
+        "highpass_hz": 95.0,
+        "hum_filter_hz": None,
+        "neural_wet_mix": 1.0,
         "suppression_strength": 1.8,
-        "spectral_floor_db": -28.0,
+        "spectral_floor_db": -30.0,
+        "dereverb_enabled": True,
+        "dereverb_strength": 0.65,
         "gate_enabled": True,
-        "gate_threshold_db": -44.0,
-        "gate_attenuation_db": -22.0,
+        "gate_threshold_db": -43.0,
+        "gate_attenuation_db": -26.0,
         "voice_eq_enabled": True,
-        "mud_cut_db": -2.5,
-        "presence_boost_db": 3.0,
-        "lowpass_hz": 13500.0,
+        "mud_cut_db": -4.5,
+        "honk_cut_db": -2.0,
+        "presence_boost_db": 3.5,
+        "air_boost_db": 2.5,
+        "lowpass_hz": 16500.0,
         "compressor_enabled": True,
         "compressor_threshold_db": -18.0,
         "compressor_ratio": 3.0,
-        "makeup_gain_db": 3.5,
+        "makeup_gain_db": 5.5,
     },
     "max_denoise": {
         "preset": "max_denoise",
-        "highpass_hz": 95.0,
-        "hum_filter_hz": 50.0,
+        "highpass_hz": 105.0,
+        "hum_filter_hz": None,
+        "neural_wet_mix": 1.0,
         "suppression_strength": 2.8,
-        "spectral_floor_db": -36.0,
+        "spectral_floor_db": -38.0,
+        "dereverb_enabled": True,
+        "dereverb_strength": 0.85,
         "gate_enabled": True,
-        "gate_threshold_db": -40.0,
-        "gate_attenuation_db": -32.0,
+        "gate_threshold_db": -39.0,
+        "gate_attenuation_db": -34.0,
         "voice_eq_enabled": True,
-        "mud_cut_db": -3.0,
-        "presence_boost_db": 3.5,
-        "lowpass_hz": 12000.0,
+        "mud_cut_db": -5.5,
+        "honk_cut_db": -2.5,
+        "presence_boost_db": 4.0,
+        "air_boost_db": 2.5,
+        "lowpass_hz": 15500.0,
         "compressor_enabled": True,
         "compressor_threshold_db": -18.0,
         "compressor_ratio": 3.5,
-        "makeup_gain_db": 4.0,
+        "makeup_gain_db": 6.0,
+    },
+    "anti_barrel": {
+        "preset": "anti_barrel",
+        "highpass_hz": 105.0,
+        "hum_filter_hz": None,
+        "neural_wet_mix": 1.0,
+        "suppression_strength": 2.2,
+        "spectral_floor_db": -32.0,
+        "dereverb_enabled": True,
+        "dereverb_strength": 1.05,
+        "gate_enabled": True,
+        "gate_threshold_db": -41.0,
+        "gate_attenuation_db": -28.0,
+        "voice_eq_enabled": True,
+        "mud_cut_db": -6.0,
+        "honk_cut_db": -3.0,
+        "presence_boost_db": 4.2,
+        "air_boost_db": 3.2,
+        "lowpass_hz": 17000.0,
+        "compressor_enabled": True,
+        "compressor_threshold_db": -18.0,
+        "compressor_ratio": 3.2,
+        "makeup_gain_db": 6.5,
     },
     "natural": {
         "preset": "natural",
-        "highpass_hz": 75.0,
-        "hum_filter_hz": 50.0,
+        "highpass_hz": 80.0,
+        "hum_filter_hz": None,
+        "neural_wet_mix": 0.92,
         "suppression_strength": 1.2,
-        "spectral_floor_db": -20.0,
+        "spectral_floor_db": -22.0,
+        "dereverb_enabled": True,
+        "dereverb_strength": 0.40,
         "gate_enabled": True,
         "gate_threshold_db": -48.0,
-        "gate_attenuation_db": -14.0,
+        "gate_attenuation_db": -16.0,
         "voice_eq_enabled": True,
-        "mud_cut_db": -1.5,
-        "presence_boost_db": 2.0,
-        "lowpass_hz": 15000.0,
+        "mud_cut_db": -2.5,
+        "honk_cut_db": -1.0,
+        "presence_boost_db": 2.2,
+        "air_boost_db": 1.5,
+        "lowpass_hz": 17500.0,
         "compressor_enabled": True,
         "compressor_threshold_db": -16.0,
         "compressor_ratio": 2.2,
@@ -136,31 +182,37 @@ PRESETS: dict[str, dict[str, Any]] = {
     },
     "gaming": {
         "preset": "gaming",
-        "highpass_hz": 90.0,
-        "hum_filter_hz": 50.0,
-        "suppression_strength": 2.2,
-        "spectral_floor_db": -32.0,
+        "highpass_hz": 100.0,
+        "hum_filter_hz": None,
+        "neural_wet_mix": 1.0,
+        "suppression_strength": 2.4,
+        "spectral_floor_db": -34.0,
+        "dereverb_enabled": True,
+        "dereverb_strength": 0.75,
         "gate_enabled": True,
-        "gate_threshold_db": -41.0,
-        "gate_attenuation_db": -28.0,
-        "gate_hold_ms": 140.0,
-        "gate_release_ms": 110.0,
+        "gate_threshold_db": -40.0,
+        "gate_attenuation_db": -30.0,
+        "gate_hold_ms": 130.0,
+        "gate_release_ms": 100.0,
         "voice_eq_enabled": True,
-        "mud_cut_db": -3.0,
+        "mud_cut_db": -5.0,
+        "honk_cut_db": -2.2,
         "presence_boost_db": 4.0,
-        "lowpass_hz": 12500.0,
+        "air_boost_db": 2.5,
+        "lowpass_hz": 16000.0,
         "compressor_enabled": True,
         "compressor_threshold_db": -20.0,
         "compressor_ratio": 4.0,
-        "makeup_gain_db": 5.0,
+        "makeup_gain_db": 4.5,
     },
 }
 
 PRESET_DESCRIPTIONS_RU: dict[str, str] = {
-    "balanced": "Оптимальный баланс: убирает шум ПК/шипение и улучшает голос без роботизации (по умолчанию)",
-    "max_denoise": "Максимальное шумоподавление: для очень шумной комнаты, гудящих кулеров и дешёвых 3.5мм микрофонов",
-    "natural": "Мягкая очистка: минимум вмешательства, естественный тембр голоса",
-    "gaming": "Для игр и Discord: чёткая разборчивость речи, подавление кликов клавиатуры и выравнивание громкости",
+    "balanced": "ИИ-шумоподавление (RNNoise) + анти-бочка + студийный голос (по умолчанию)",
+    "max_denoise": "Максимальное подавление скрипа стула, клавиатуры, кулеров и гула комнаты",
+    "anti_barrel": "Усиленное удаление эффекта «звука из бочки» / эха пустой комнаты + открытый верх",
+    "natural": "Мягкая деликатная очистка с максимально естественным тембром",
+    "gaming": "Для игр, ГС и Discord: плотный близкий голос и жёсткое отсечение посторонних звуков",
 }
 
 

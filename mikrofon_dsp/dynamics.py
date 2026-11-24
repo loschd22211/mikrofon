@@ -53,7 +53,7 @@ class SmoothNoiseGate:
             level_db = 20.0 * math.log10(rms + eps)
 
             is_active_voice = (
-                speech_prob >= 0.55
+                (level_db >= (self.threshold_db - 3.0) and speech_prob >= 0.55)
                 or (level_db >= self.threshold_db and speech_prob >= 0.25)
                 or level_db >= (self.threshold_db + 10.0)
             )

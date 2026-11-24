@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import numpy as np
-from scipy import signal
 from scipy.io import wavfile
 
 from .config import DenoiserConfig, preset_config
+from .dereverb import SpectralDereverb
 from .dynamics import SmoothNoiseGate, VoiceCompressorLimiter
 from .filters import StreamingSOSFilter, build_prefilter, build_voice_eq
+from .neural import NeuralRNNoiseDenoiser, is_neural_rnnoise_available
 from .spectral import AdaptiveSpectralDenoiser, MicDiagnostics, analyze_microphone_noise
 
 
@@ -16,11 +17,12 @@ class VoiceEnhancerPipeline:
     """
     Complete low-latency streaming audio processor for budget microphones:
       1. Input Pre-Gain
-      2. Rumble High-Pass Filter (85 Hz) + Mains Hum Harmonic Notches (50/60 Hz)
-      3. Ephraim-Malah Adaptive Spectral Noise Suppressor (STFT Overlap-Add)
-      4. Smooth Voice-Aware Noise Gate / Downward Expander
-      5. Studio Voice Clarity EQ (Anti-Mud + Presence Boost + HF Hiss Roll-Off)
-      6. Broadcast Compressor + Makeup Gain + Soft-Knee Brickwall Limiter
+      2. Rumble High-Pass Filter (95 Hz) + optional sub-vocal mains notch
+      3. Neural RNNoise v0.2 (anti-chair-creak / typing / clatter) or Adaptive Spectral fallback
+      4. Spectral Dereverberator ("Анти-бочка" — removes hollow room reflections)
+      5. Smooth Neural-VAD Noise Gate / Downward Expander
+      6. Studio Anti-Barrel Voice Clarity EQ (380 Hz boxiness cut + 3.8 kHz presence + 8.2 kHz Air)
+      7. Broadcast Compressor + Makeup Gain + Soft-Knee Brickwall Limiter
     """
 
     def __init__(self, config: DenoiserConfig | None = None) -> None:
@@ -38,12 +40,35 @@ class VoiceEnhancerPipeline:
             hum_filter_hz=self.config.hum_filter_hz,
         )
 
+        want_neural = self.config.engine in ("auto", "rnnoise")
+        if self.config.engine == "rnnoise" and not is_neural_rnnoise_available():
+            raise RuntimeError(
+                "Запрошен движок 'rnnoise', но пакет `pyrnnoise` не установлен. "
+                "Выполните: pip install --no-deps pyrnnoise"
+            )
+
+        self.use_neural = want_neural and is_neural_rnnoise_available()
+        self.neural: NeuralRNNoiseDenoiser | None = (
+            NeuralRNNoiseDenoiser(
+                sample_rate=self.sample_rate,
+                wet_mix=self.config.neural_wet_mix,
+            )
+            if self.use_neural
+            else None
+        )
+
         self.spectral = AdaptiveSpectralDenoiser(
             sample_rate=self.sample_rate,
             frame_ms=self.config.frame_ms,
             suppression_strength=self.config.suppression_strength,
             spectral_floor_db=self.config.spectral_floor_db,
             vad_snr_threshold_db=self.config.vad_snr_threshold_db,
+        )
+
+        self.dereverb = SpectralDereverb(
+            sample_rate=self.sample_rate,
+            frame_ms=self.config.frame_ms,
+            strength=self.config.dereverb_strength if self.config.dereverb_enabled else 0.0,
         )
 
         self.gate = SmoothNoiseGate(
@@ -57,7 +82,9 @@ class VoiceEnhancerPipeline:
         self.voice_eq: StreamingSOSFilter = build_voice_eq(
             sample_rate=self.sample_rate,
             mud_cut_db=self.config.mud_cut_db,
+            honk_cut_db=self.config.honk_cut_db,
             presence_boost_db=self.config.presence_boost_db,
+            air_boost_db=self.config.air_boost_db,
             lowpass_hz=self.config.lowpass_hz,
         )
 
@@ -71,10 +98,30 @@ class VoiceEnhancerPipeline:
         # Live telemetry for UI/CLI meters
         self.last_input_rms_db: float = -96.0
         self.last_output_rms_db: float = -96.0
+        self.last_reduction_db: float = 0.0
+        self.last_speech_prob: float = 0.0
+
+    @property
+    def active_engine_name(self) -> str:
+        return "RNNoise v0.2 Neural AI" if self.use_neural else "Adaptive Spectral DSP"
+
+    @property
+    def algorithmic_delay_samples(self) -> int:
+        delay = 0
+        if self.use_neural:
+            delay += self.hop_size
+        else:
+            delay += 2 * self.hop_size
+        if self.config.dereverb_enabled and self.config.dereverb_strength > 1e-3:
+            delay += 2 * self.hop_size
+        return delay
 
     def reset(self) -> None:
         self.prefilter.reset()
+        if self.neural is not None:
+            self.neural.reset()
         self.spectral.reset()
+        self.dereverb.reset()
         self.gate.reset()
         self.voice_eq.reset()
         self.compressor.reset()
@@ -111,22 +158,36 @@ class VoiceEnhancerPipeline:
         if abs(self._input_lin_gain - 1.0) > 1e-4:
             x = x * self._input_lin_gain
 
-        # 2. Rumble high-pass + 50/60 Hz mains hum harmonic notch filter
+        # 2. Rumble high-pass + optional sub-vocal hum notch
         x = self.prefilter.process(x)
 
-        # 3. Adaptive Ephraim-Malah spectral noise suppression
-        x = self.spectral.process(x)
+        # 3. Primary noise suppression (Neural RNNoise v0.2 or Spectral fallback)
+        if self.neural is not None:
+            x = self.neural.process(x)
+            speech_prob = self.neural.last_speech_prob
+            self.last_reduction_db = self.neural.last_reduction_db
+        else:
+            x = self.spectral.process(x)
+            speech_prob = self.spectral.last_speech_prob
+            self.last_reduction_db = self.spectral.last_reduction_db
 
-        # 4. Smooth voice-aware noise gate / downward expander
-        if self.config.gate_enabled:
-            x = self.gate.process(x, speech_prob=self.spectral.last_speech_prob)
+        self.last_speech_prob = speech_prob
 
-        # 5. Studio voice clarity EQ
+        # 4. Real-time room dereverberation ("Анти-бочка")
+        if self.config.dereverb_enabled and self.config.dereverb_strength > 1e-3:
+            x = self.dereverb.process(x)
+
+        # 5. Studio Anti-Barrel Voice Clarity EQ + Open Air
         if self.config.voice_eq_enabled:
             x = self.voice_eq.process(x)
 
-        # 6. Broadcast compressor + brickwall soft limiter
+        # 6. Broadcast compressor + makeup gain (before gate so makeup gain never lifts residual silence)
         x = self.compressor.process(x, enabled=self.config.compressor_enabled)
+
+        # 7. Smooth voice-aware noise gate / downward expander + final brickwall safety limit
+        if self.config.gate_enabled:
+            x = self.gate.process(x, speech_prob=speech_prob)
+            x = self.compressor.soft_limit(x)
 
         out_rms = float(np.sqrt(np.mean(x * x) + eps))
         self.last_output_rms_db = float(20.0 * np.log10(out_rms + eps))
@@ -168,8 +229,13 @@ def build_calibrated_config(
             output_device=base_config.output_device,
         )
 
-    # Keep 50 Hz notch on by default for protection unless 60 Hz hum was specifically detected
-    hum_hz = diag.detected_hum_hz if diag.detected_hum_hz is not None else 50.0
+    # Only enable narrow IIR mains notch when strong (>14 dB) 50/60 Hz ground loop is detected;
+    # otherwise RNNoise + 95 Hz high-pass remove hum without any phase coloration.
+    hum_hz = (
+        diag.detected_hum_hz
+        if (diag.detected_hum_hz is not None and diag.hum_prominence_db >= 14.0)
+        else None
+    )
     cfg = replace(
         cfg,
         sample_rate=sample_rate,
@@ -210,15 +276,14 @@ def process_wav_file(
     output_path: Path | str,
     config: DenoiserConfig | None = None,
 ) -> tuple[int, float]:
-    """Clean an offline WAV recording and compensate for STFT framing delay."""
+    """Clean an offline WAV recording and compensate for framing delay."""
     sr, audio = read_wav_float32(input_path)
     cfg = replace(config or DenoiserConfig(), sample_rate=sr)
     pipeline = VoiceEnhancerPipeline(cfg)
 
     mono = pipeline._to_mono(audio)
-    # Seed initial noise estimate from quietest 250ms segment in the file
     seg_len = max(int(0.25 * sr), pipeline.spectral.win_size)
-    if mono.size >= seg_len * 2:
+    if not pipeline.use_neural and mono.size >= seg_len * 2:
         step = seg_len // 2
         best_rms = float("inf")
         quiet_seg = mono[:seg_len]
@@ -230,8 +295,7 @@ def process_wav_file(
                 quiet_seg = cand
         pipeline.calibrate_silence(quiet_seg)
 
-    # Pad tail by 2 hops and trim leading 2-hop STFT framing delay so output aligns in time
-    delay = 2 * pipeline.hop_size
+    delay = pipeline.algorithmic_delay_samples
     padded = np.concatenate((mono, np.zeros(delay, dtype=np.float32)))
     out_chunks = []
     hop = pipeline.hop_size
@@ -240,7 +304,6 @@ def process_wav_file(
     full_out = np.concatenate(out_chunks)
     aligned = full_out[delay : delay + mono.size]
 
-    # If original WAV was stereo, preserve channel count
     if audio.ndim == 2 and audio.shape[1] > 1:
         aligned = np.repeat(aligned.reshape(-1, 1), audio.shape[1], axis=1)
 

@@ -1,7 +1,8 @@
-# Virtual environments
+# Virtual environments & local cache
 .venv/
 venv/
 ENV/
+.cache/
 
 # Python cache & build artifacts
 __pycache__/
